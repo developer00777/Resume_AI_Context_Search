@@ -53,9 +53,9 @@ async def lifespan(app: FastAPI):
         neo4j_uri=settings.neo4j_uri,
         neo4j_user=settings.neo4j_user,
         neo4j_password=settings.neo4j_password,
-        openai_api_key=settings.openai_api_key,
-        openai_base_url=settings.openai_base_url,
-        model_name=settings.model_name,
+        llm_api_key=settings.llm_api_key,
+        llm_base_url=settings.llm_base_url,
+        llm_model=settings.llm_model,
         embedding_model=settings.embedding_model,
         embedding_api_key=settings.embedding_api_key,
         embedding_base_url=settings.embedding_base_url,
@@ -115,6 +115,7 @@ async def health_check():
         except Exception:
             pass
 
+    settings = get_settings()
     status = "healthy" if neo4j_ok else ("degraded" if resume_service else "unhealthy")
     return HealthResponse(
         status=status,
@@ -122,6 +123,10 @@ async def health_check():
         version="1.0.0",
         neo4j_connected=neo4j_ok,
         uptime_seconds=round(time.time() - _start_time, 1),
+        llm_mode="local" if settings.llm_is_local else "openrouter",
+        llm_model=settings.llm_model,
+        embedding_mode="local" if settings.embedding_is_local else "openrouter",
+        embedding_model=settings.embedding_model,
     )
 
 
@@ -146,8 +151,8 @@ async def ingest_resume(request: ResumeIngestRequest):
         candidate_name=request.candidate_name,
         parsed_on=parsed_on,
     )
-    await service.ingest_resume(resume)
-    return IngestResponse(message="Resume ingested", episodes_ingested=1)
+    candidate_uuid = await service.ingest_resume(resume)
+    return IngestResponse(message="Resume ingested", episodes_ingested=1, candidate_uuid=candidate_uuid)
 
 
 @app.post("/api/ingest/bulk", response_model=IngestResponse, dependencies=[Depends(verify_api_key)])
@@ -170,8 +175,12 @@ async def ingest_resumes_bulk(request: ResumeBulkIngestRequest):
             parsed_on=parsed_on,
         ))
 
-    await service.ingest_resumes_bulk(resumes)
-    return IngestResponse(message=f"Ingested {len(resumes)} resumes", episodes_ingested=len(resumes))
+    candidate_uuids = await service.ingest_resumes_bulk(resumes)
+    return IngestResponse(
+        message=f"Ingested {len(resumes)} resumes",
+        episodes_ingested=len(resumes),
+        candidate_uuids=candidate_uuids,
+    )
 
 
 # ── Search ─────────────────────────────────────────────────────────────────────

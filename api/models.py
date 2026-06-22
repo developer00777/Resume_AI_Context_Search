@@ -14,6 +14,10 @@ class HealthResponse(BaseModel):
     version: str
     neo4j_connected: bool
     uptime_seconds: float
+    llm_mode: str = "unknown"        # "openrouter" | "local"
+    llm_model: str = ""
+    embedding_mode: str = "unknown"  # "openrouter" | "local"
+    embedding_model: str = ""
 
 
 # --- Ingest ---
@@ -36,6 +40,8 @@ class IngestResponse(BaseModel):
     success: bool = True
     message: str
     episodes_ingested: int
+    candidate_uuid: Optional[str] = None        # single ingest
+    candidate_uuids: Optional[list[str]] = None  # bulk ingest
 
 
 # --- Search ---
