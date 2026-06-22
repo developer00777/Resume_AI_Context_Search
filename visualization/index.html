@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Account Knowledge Graph</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            overflow: hidden;
+        }
+
+        #container {
+            display: flex;
+            height: 100vh;
+        }
+
+        #sidebar {
+            width: 300px;
+            background: #16213e;
+            padding: 20px;
+            overflow-y: auto;
+            border-right: 1px solid #0f3460;
+        }
+
+        #graph {
+            flex: 1;
+            position: relative;
+        }
+
+        h1 {
+            font-size: 1.2rem;
+            margin-bottom: 20px;
+            color: #4ECDC4;
+        }
+
+        h2 {
+            font-size: 1rem;
+            margin: 15px 0 10px;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .legend {
+            margin-bottom: 20px;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin: 5px 0;
+            font-size: 0.9rem;
+        }
+
+        .legend-color {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            margin-right: 10px;
+        }
+
+        .node-details {
+            background: #0f3460;
+            border-radius: 8px;
+            padding: 15px;
+            margin-top: 20px;
+            display: none;
+        }
+
+        .node-details.active {
+            display: block;
+        }
+
+        .node-details h3 {
+            color: #4ECDC4;
+            margin-bottom: 10px;
+        }
+
+        .node-details p {
+            font-size: 0.9rem;
+            line-height: 1.5;
+            margin: 5px 0;
+        }
+
+        .node-details .label {
+            color: #888;
+            font-size: 0.8rem;
+        }
+
+        #search {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #0f3460;
+            border-radius: 4px;
+            background: #1a1a2e;
+            color: #eee;
+            margin-bottom: 15px;
+        }
+
+        #search:focus {
+            outline: none;
+            border-color: #4ECDC4;
+        }
+
+        .controls {
+            margin-bottom: 20px;
+        }
+
+        button {
+            background: #4ECDC4;
+            color: #1a1a2e;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: 600;
+            margin-right: 5px;
+            margin-bottom: 5px;
+        }
+
+        button:hover {
+            background: #45B7D1;
+        }
+
+        .tooltip {
+            position: absolute;
+            background: rgba(22, 33, 62, 0.95);
+            color: #eee;
+            padding: 10px 15px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            pointer-events: none;
+            max-width: 300px;
+            border: 1px solid #0f3460;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+        }
+
+        .stats {
+            font-size: 0.9rem;
+            color: #888;
+            margin-top: 10px;
+        }
+
+        .link {
+            stroke-opacity: 0.6;
+        }
+
+        .link:hover {
+            stroke-opacity: 1;
+        }
+
+        .node circle {
+            stroke: #fff;
+            stroke-width: 2px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .node circle:hover {
+            stroke-width: 4px;
+        }
+
+        .node text {
+            font-size: 11px;
+            fill: #ccc;
+            pointer-events: none;
+        }
+
+        .node.highlighted circle {
+            stroke: #FFD700;
+            stroke-width: 4px;
+        }
+
+        .link-label {
+            font-size: 9px;
+            fill: #888;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="sidebar">
+            <h1>Knowledge Graph</h1>
+
+            <input type="text" id="search" placeholder="Search nodes...">
+
+            <div class="controls">
+                <button onclick="resetZoom()">Reset View</button>
+                <button onclick="toggleLabels()">Toggle Labels</button>
+            </div>
+
+            <h2>Legend</h2>
+            <div class="legend" id="legend"></div>
+
+            <div class="stats" id="stats"></div>
+
+            <div class="node-details" id="nodeDetails">
+                <h3 id="nodeName"></h3>
+                <p><span class="label">Type:</span> <span id="nodeType"></span></p>
+                <p><span class="label">Summary:</span></p>
+                <p id="nodeSummary"></p>
+            </div>
+        </div>
+        <div id="graph"></div>
+    </div>
+
+    <script>
+        // Configuration
+        const colors = {
+            'Contact': '#4ECDC4',
+            'Account': '#FF6B6B',
+            'TeamMember': '#45B7D1',
+            'Topic': '#96CEB4',
+            'PersonalDetail': '#FFEAA7',
+            'Communication': '#DDA0DD',
+            'Opportunity': '#FFB347',
+            'Branch': '#FF69B4',
+            'Entity': '#999999'
+        };
+
+        let showLabels = true;
+        let graphData = null;
+        let simulation = null;
+        let svg = null;
+        let g = null;
+        let zoom = null;
+
+        // Load graph data
+        async function loadGraph() {
+            try {
+                const response = await fetch('graph_data.json');
+                graphData = await response.json();
+                renderGraph(graphData);
+            } catch (e) {
+                console.log('No graph_data.json found. Using sample data.');
+                graphData = getSampleData();
+                renderGraph(graphData);
+            }
+        }
+
+        function getSampleData() {
+            return {
+                nodes: [
+                    { id: '1', label: 'John Smith', type: 'Contact', color: colors.Contact },
+                    { id: '2', label: 'Acme Corp', type: 'Account', color: colors.Account },
+                    { id: '3', label: 'Sarah Johnson', type: 'TeamMember', color: colors.TeamMember },
+                    { id: '4', label: 'Partnership', type: 'Topic', color: colors.Topic },
+                    { id: '5', label: 'Baseball fan', type: 'PersonalDetail', color: colors.PersonalDetail },
+                ],
+                edges: [
+                    { source: '1', target: '2', label: 'WORKS_AT' },
+                    { source: '3', target: '1', label: 'SENT_EMAIL_TO' },
+                    { source: '3', target: '4', label: 'DISCUSSED' },
+                    { source: '1', target: '5', label: 'HAS_DETAIL' },
+                ]
+            };
+        }
+
+        function renderGraph(data) {
+            // Clear existing
+            d3.select('#graph').selectAll('*').remove();
+
+            const container = document.getElementById('graph');
+            const width = container.clientWidth;
+            const height = container.clientHeight;
+
+            // Create SVG
+            svg = d3.select('#graph')
+                .append('svg')
+                .attr('width', width)
+                .attr('height', height);
+
+            // Zoom behavior
+            zoom = d3.zoom()
+                .scaleExtent([0.1, 4])
+                .on('zoom', (event) => {
+                    g.attr('transform', event.transform);
+                });
+
+            svg.call(zoom);
+
+            g = svg.append('g');
+
+            // Create tooltip
+            const tooltip = d3.select('body')
+                .append('div')
+                .attr('class', 'tooltip')
+                .style('opacity', 0);
+
+            // Process edges to use node references
+            const nodeMap = new Map(data.nodes.map(n => [n.id, n]));
+            const links = data.edges.map(e => ({
+                ...e,
+                source: nodeMap.get(e.source) || e.source,
+                target: nodeMap.get(e.target) || e.target
+            })).filter(e => e.source && e.target);
+
+            // Create simulation
+            simulation = d3.forceSimulation(data.nodes)
+                .force('link', d3.forceLink(links).id(d => d.id).distance(120))
+                .force('charge', d3.forceManyBody().strength(-400))
+                .force('center', d3.forceCenter(width / 2, height / 2))
+                .force('collision', d3.forceCollide().radius(40));
+
+            // Draw links
+            const link = g.append('g')
+                .selectAll('line')
+                .data(links)
+                .enter()
+                .append('line')
+                .attr('class', 'link')
+                .attr('stroke', '#0f3460')
+                .attr('stroke-width', 2);
+
+            // Draw link labels
+            const linkLabel = g.append('g')
+                .selectAll('text')
+                .data(links)
+                .enter()
+                .append('text')
+                .attr('class', 'link-label')
+                .text(d => d.label || '');
+
+            // Draw nodes
+            const node = g.append('g')
+                .selectAll('g')
+                .data(data.nodes)
+                .enter()
+                .append('g')
+                .attr('class', 'node')
+                .call(d3.drag()
+                    .on('start', dragstarted)
+                    .on('drag', dragged)
+                    .on('end', dragended));
+
+            node.append('circle')
+                .attr('r', d => d.size || 12)
+                .attr('fill', d => d.color || colors[d.type] || '#999')
+                .on('mouseover', (event, d) => {
+                    tooltip.transition().duration(200).style('opacity', 1);
+                    tooltip.html(`<strong>${d.label}</strong><br>Type: ${d.type}`)
+                        .style('left', (event.pageX + 10) + 'px')
+                        .style('top', (event.pageY - 10) + 'px');
+                })
+                .on('mouseout', () => {
+                    tooltip.transition().duration(200).style('opacity', 0);
+                })
+                .on('click', (event, d) => showNodeDetails(d));
+
+            node.append('text')
+                .attr('x', 15)
+                .attr('y', 4)
+                .text(d => d.label)
+                .style('display', showLabels ? 'block' : 'none');
+
+            // Update positions
+            simulation.on('tick', () => {
+                link
+                    .attr('x1', d => d.source.x)
+                    .attr('y1', d => d.source.y)
+                    .attr('x2', d => d.target.x)
+                    .attr('y2', d => d.target.y);
+
+                linkLabel
+                    .attr('x', d => (d.source.x + d.target.x) / 2)
+                    .attr('y', d => (d.source.y + d.target.y) / 2);
+
+                node.attr('transform', d => `translate(${d.x},${d.y})`);
+            });
+
+            // Update stats and legend
+            updateStats(data);
+            updateLegend(data);
+
+            // Search functionality
+            document.getElementById('search').addEventListener('input', (e) => {
+                const query = e.target.value.toLowerCase();
+                node.classed('highlighted', d =>
+                    query && d.label.toLowerCase().includes(query)
+                );
+            });
+        }
+
+        function dragstarted(event, d) {
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+        }
+
+        function dragged(event, d) {
+            d.fx = event.x;
+            d.fy = event.y;
+        }
+
+        function dragended(event, d) {
+            if (!event.active) simulation.alphaTarget(0);
+            d.fx = null;
+            d.fy = null;
+        }
+
+        function showNodeDetails(node) {
+            document.getElementById('nodeDetails').classList.add('active');
+            document.getElementById('nodeName').textContent = node.label;
+            document.getElementById('nodeType').textContent = node.type;
+            document.getElementById('nodeSummary').textContent =
+                node.properties?.summary || node.summary || 'No summary available';
+        }
+
+        function updateStats(data) {
+            const stats = document.getElementById('stats');
+            stats.innerHTML = `
+                <p>Nodes: ${data.nodes.length}</p>
+                <p>Edges: ${data.edges.length}</p>
+            `;
+        }
+
+        function updateLegend(data) {
+            const legend = document.getElementById('legend');
+            const types = [...new Set(data.nodes.map(n => n.type))];
+
+            legend.innerHTML = types.map(type => `
+                <div class="legend-item">
+                    <div class="legend-color" style="background: ${colors[type] || '#999'}"></div>
+                    <span>${type}</span>
+                </div>
+            `).join('');
+        }
+
+        function resetZoom() {
+            svg.transition().duration(500).call(
+                zoom.transform,
+                d3.zoomIdentity
+            );
+        }
+
+        function toggleLabels() {
+            showLabels = !showLabels;
+            d3.selectAll('.node text')
+                .style('display', showLabels ? 'block' : 'none');
+        }
+
+        // Initialize
+        loadGraph();
+
+        // Handle resize
+        window.addEventListener('resize', () => {
+            if (graphData) renderGraph(graphData);
+        });
+    </script>
+</body>
+</html>
