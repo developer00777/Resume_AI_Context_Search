@@ -203,6 +203,7 @@ async def search(request: SearchRequest):
             edges=results["edges"],
             total_nodes=len(results["nodes"]),
             total_edges=len(results["edges"]),
+            parsed_filters=results.get("parsed_filters"),
         )
     except Exception as e:
         logger.error("Search failed: %s", e)
@@ -290,6 +291,25 @@ async def compute_yoe(
         parsed_on=parsed,
     )
     return {"years_of_experience": yoe}
+
+
+# ── Graph edge rebuild ─────────────────────────────────────────────────────────
+
+
+@app.post("/api/graph/rebuild-edges", dependencies=[Depends(verify_api_key)])
+async def rebuild_edges():
+    """
+    Manually trigger SKILL_CO_OCCURS_WITH and SIMILAR_TO edge recomputation.
+
+    This runs automatically after every ingest batch. Call this endpoint if you
+    want to force a rebuild (e.g. after a large initial bulk load).
+    Runs synchronously so the response confirms completion.
+    """
+    service = _require_service()
+    if not service._edge_builder:
+        raise HTTPException(status_code=503, detail="EdgeBuilder not initialised")
+    summary = await service._edge_builder.build_all()
+    return {"success": True, **summary}
 
 
 # ── Graph visualization ────────────────────────────────────────────────────────

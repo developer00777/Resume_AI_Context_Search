@@ -21,6 +21,15 @@ class Candidate(BaseModel):
     current_location: Optional[str] = Field(None, description="Current city or region where the candidate is based")
     email: Optional[str] = Field(None, description="Contact email if present in the resume")
     phone: Optional[str] = Field(None, description="Contact phone number if present")
+    industries: Optional[list[str]] = Field(
+        None,
+        description=(
+            "Industries the candidate has worked in, based on their employer history. "
+            "Use standard sector names: FinTech, SaaS, Healthcare, E-commerce, "
+            "EdTech, Consulting, Banking, Telecom, Manufacturing, Media, Government. "
+            "Extract all that apply."
+        )
+    )
 
 
 class Skill(BaseModel):

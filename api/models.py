@@ -59,6 +59,7 @@ class SearchResponse(BaseModel):
     edges: list[dict[str, Any]]
     total_nodes: int
     total_edges: int
+    parsed_filters: Optional[dict[str, Any]] = None  # structured filters extracted from the query
 
 
 # --- Candidate ---

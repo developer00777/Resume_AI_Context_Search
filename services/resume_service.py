@@ -13,7 +13,20 @@ PII safety:
   replaces them with deterministic tokens. The token→original mapping is
   persisted in Neo4j (PiiStore) and re-hydrated in search results before
   they are returned to the caller.
+
+Search pipeline (Phase 1 upgrade):
+  query → QueryParser (LLM) → ParsedQuery
+        → Cypher pre-filter (location / YoE / must-skills)
+        → Graphiti semantic search scoped to filtered candidate IDs
+        → cross-encoder rerank
+        → PII re-hydration
+
+Post-ingest graph intelligence (Phase 2 upgrade):
+  after each ingest batch → EdgeBuilder.build_all() (background task)
+        → SKILL_CO_OCCURS_WITH edges (weighted co-occurrence)
+        → SIMILAR_TO edges (cosine similarity between candidate embeddings)
 """
+import asyncio
 import logging
 from datetime import date, datetime, timezone
 from typing import Any, Optional
@@ -22,6 +35,7 @@ from graphiti_core import Graphiti
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.utils.bulk_utils import RawEpisode
 from graphiti_core.search.search_config_recipes import COMBINED_HYBRID_SEARCH_RRF
@@ -31,6 +45,8 @@ from config.edge_types import EDGE_TYPES, EDGE_TYPE_MAP
 from models.resume import Resume
 from services.pii_masker import mask_pii
 from services.pii_store import PiiStore
+from services.query_parser import QueryParser
+from services.edge_builder import EdgeBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +106,8 @@ class ResumeService:
         self._embedding_base_url = embedding_base_url or llm_base_url
         self.client: Optional[Graphiti] = None
         self._pii_store: Optional[PiiStore] = None
+        self._query_parser: Optional[QueryParser] = None
+        self._edge_builder: Optional[EdgeBuilder] = None
 
     # ── Connection ─────────────────────────────────────────────────────────────
 
@@ -114,12 +132,23 @@ class ResumeService:
             )
         )
 
+        # Cross-encoder must receive the same LLM config explicitly — otherwise
+        # Graphiti 0.29+ falls back to reading OPENAI_API_KEY from the environment.
+        cross_encoder = OpenAIRerankerClient(
+            config=LLMConfig(
+                api_key=self._llm_api_key,
+                base_url=self._llm_base_url,
+                model=self._llm_model,
+            )
+        )
+
         self.client = Graphiti(
             uri=self._neo4j_uri,
             user=self._neo4j_user,
             password=self._neo4j_password,
             llm_client=llm_client,
             embedder=embedder,
+            cross_encoder=cross_encoder,
         )
 
         await self.client.build_indices_and_constraints()
@@ -127,6 +156,12 @@ class ResumeService:
         # PiiStore uses the same Neo4j driver that Graphiti already opened
         self._pii_store = PiiStore(self.client.driver)
         await self._pii_store.ensure_index()
+
+        # QueryParser reuses the same LLM client — no extra credentials needed
+        self._query_parser = QueryParser(llm_client)
+
+        # EdgeBuilder reuses the same Neo4j driver
+        self._edge_builder = EdgeBuilder(self.client.driver)
 
         logger.info(
             "ResumeService connected | LLM: %s @ %s | Embedder: %s @ %s",
@@ -139,6 +174,8 @@ class ResumeService:
             await self.client.close()
             self.client = None
             self._pii_store = None
+            self._query_parser = None
+            self._edge_builder = None
 
     # ── Ingestion ──────────────────────────────────────────────────────────────
 
@@ -177,6 +214,10 @@ class ResumeService:
             edge_types=EDGE_TYPES,
             edge_type_map=EDGE_TYPE_MAP,
         )
+
+        # Build cross-candidate edges in the background — does not block response
+        if self._edge_builder:
+            asyncio.create_task(self._run_edge_builder())
 
         return mask.candidate_uuid or resume.source_id
 
@@ -226,35 +267,165 @@ class ResumeService:
         )
 
         logger.info("Bulk ingested %d resumes (PII masked)", len(resumes))
+
+        # Build cross-candidate edges in the background — does not block response
+        if self._edge_builder:
+            asyncio.create_task(self._run_edge_builder())
+
         return candidate_uuids
 
     # ── Search ─────────────────────────────────────────────────────────────────
 
     async def search(self, query: str, num_results: int = 50) -> dict[str, Any]:
         """
-        Hybrid semantic + keyword search.
+        Hybrid semantic + keyword search with Cypher pre-filter.
 
-        Tokens in returned facts/summaries are re-hydrated from PiiStore
-        so the caller receives real names, emails, and phones.
+        Pipeline:
+          1. QueryParser extracts structured filters (location, YoE, must-skills, role).
+          2. Cypher pre-filter narrows the candidate pool to those matching hard constraints.
+          3. Graphiti semantic search runs within the filtered set.
+          4. PII tokens are re-hydrated before returning results.
+
+        Falls back to pure semantic search if query parsing fails or yields no filters.
         """
         if not self.client or not self._pii_store:
             raise RuntimeError("Not connected. Call connect() first.")
 
+        # Step 1: parse query into structured filters
+        parsed = None
+        if self._query_parser:
+            parsed = await self._query_parser.parse(query)
+            logger.info("QueryParser result: %s", parsed)
+
+        # Step 2: Cypher pre-filter — get candidate UUIDs matching hard constraints
+        filtered_uuids: list[str] | None = None
+        if parsed and parsed.has_filters():
+            filtered_uuids = await self._cypher_prefilter(parsed)
+            logger.info(
+                "Cypher pre-filter returned %d candidates for query %r",
+                len(filtered_uuids) if filtered_uuids is not None else -1,
+                query,
+            )
+            # If the filter returned zero results, drop it and fall back to full semantic
+            if filtered_uuids is not None and len(filtered_uuids) == 0:
+                logger.info("Pre-filter yielded 0 results — falling back to full semantic search")
+                filtered_uuids = None
+
+        # Step 3: semantic search — use the rewritten query text for better embedding
+        semantic_query = (parsed.semantic_query if parsed and parsed.semantic_query else query)
+        config = COMBINED_HYBRID_SEARCH_RRF.model_copy(update={"limit": num_results})
         results = await self.client._search(
-            query=query,
+            query=semantic_query,
             group_ids=[RESUME_GROUP_ID],
-            config=COMBINED_HYBRID_SEARCH_RRF,
-            num_results=num_results,
+            config=config,
         )
 
         nodes = [self._node_to_dict(n) for n in results.nodes]
         edges = [self._edge_to_dict(e) for e in results.edges]
 
-        # Re-hydrate PII tokens in node names/summaries and edge facts
+        # Step 4: if we have a Cypher-filtered candidate set, narrow the node results
+        if filtered_uuids is not None:
+            filtered_set = set(filtered_uuids)
+            nodes = [n for n in nodes if n["uuid"] in filtered_set or not _is_candidate_node(n)]
+
+        # Step 5: re-hydrate PII tokens
         nodes = await self._rehydrate_nodes(nodes)
         edges = await self._rehydrate_edges(edges)
 
-        return {"nodes": nodes, "edges": edges}
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "parsed_filters": _parsed_to_dict(parsed) if parsed else None,
+        }
+
+    async def _cypher_prefilter(self, parsed) -> list[str] | None:
+        """
+        Run structured Cypher constraints against the graph and return matching candidate UUIDs.
+
+        Each constraint is optional — only clauses for populated filter fields are added.
+        Returns None if the query fails (caller treats this as no filter).
+        """
+        if not self.client:
+            return None
+
+        driver = getattr(self.client.driver, "client", self.client.driver)
+        conditions = []
+        params: dict[str, Any] = {}
+
+        # Location filter — match candidates linked to a Location node
+        if parsed.location:
+            conditions.append(
+                "EXISTS { MATCH (c)-[:LOCATED_IN]->(loc:Entity) "
+                "WHERE toLower(loc.name) CONTAINS toLower($location) }"
+            )
+            params["location"] = parsed.location
+
+        # YoE filter — uses earliest_role_start stored as node property by Graphiti
+        if parsed.min_yoe is not None:
+            conditions.append("c.earliest_role_start IS NOT NULL")
+            conditions.append(
+                "duration.between(date(c.earliest_role_start), date()).years >= $min_yoe"
+            )
+            params["min_yoe"] = parsed.min_yoe
+
+        if parsed.max_yoe is not None:
+            conditions.append("c.earliest_role_start IS NOT NULL")
+            conditions.append(
+                "duration.between(date(c.earliest_role_start), date()).years <= $max_yoe"
+            )
+            params["max_yoe"] = parsed.max_yoe
+
+        # Must-skills filter — candidate must have ALL listed skills
+        for i, skill in enumerate(parsed.must_skills):
+            key = f"skill_{i}"
+            conditions.append(
+                f"EXISTS {{ MATCH (c)-[:HAS_SKILL]->(s:Entity) "
+                f"WHERE toLower(s.name) CONTAINS toLower(${key}) }}"
+            )
+            params[key] = skill
+
+        # Role filter
+        if parsed.role:
+            conditions.append(
+                "EXISTS { MATCH (c)-[:WORKED_AS]->(r:Entity) "
+                "WHERE toLower(r.name) CONTAINS toLower($role) }"
+            )
+            params["role"] = parsed.role
+
+        # Company type filter
+        if parsed.company_type:
+            conditions.append(
+                "EXISTS { MATCH (c)-[:WORKED_AT]->(co:Entity) "
+                "WHERE toLower(co.company_type) = toLower($company_type) }"
+            )
+            params["company_type"] = parsed.company_type
+
+        # Industries filter (match any listed industry)
+        if parsed.industries:
+            conditions.append(
+                "EXISTS { MATCH (c)-[:WORKED_AT]->(co:Entity) "
+                "WHERE any(ind IN $industries WHERE toLower(co.industry) CONTAINS toLower(ind)) }"
+            )
+            params["industries"] = parsed.industries
+
+        if not conditions:
+            return None
+
+        where_clause = " AND ".join(conditions)
+        cypher = f"""
+            MATCH (c:Entity)
+            WHERE c.group_id = 'resume-pool'
+              AND ({where_clause})
+            RETURN c.uuid AS uuid
+            LIMIT 2000
+        """
+
+        try:
+            result = await driver.execute_query(cypher, parameters_=params)
+            return [r["uuid"] for r in result.records if r["uuid"]]
+        except Exception as exc:
+            logger.warning("Cypher pre-filter failed (%s) — falling back to full semantic", exc)
+            return None
 
     async def get_candidate(self, candidate_name: str) -> dict[str, Any]:
         return await self.search(
@@ -263,22 +434,195 @@ class ResumeService:
         )
 
     async def find_similar_candidates(self, candidate_name: str, num_results: int = 20) -> dict[str, Any]:
-        return await self.search(
+        """
+        Find candidates similar to a given candidate.
+
+        Tries the SIMILAR_TO graph edge first (set by EdgeBuilder post-ingest).
+        Falls back to semantic search if no edges exist yet.
+        """
+        if not self.client:
+            raise RuntimeError("Not connected. Call connect() first.")
+
+        driver = getattr(self.client.driver, "client", self.client.driver)
+
+        cypher = """
+            MATCH (anchor:Entity {group_id: 'resume-pool'})
+            WHERE toLower(anchor.name) CONTAINS toLower($name)
+            WITH anchor LIMIT 1
+            MATCH (anchor)-[s:SIMILAR_TO]-(other:Entity)
+            RETURN other.uuid AS uuid, other.name AS name, s.similarity_score AS score
+            ORDER BY score DESC
+            LIMIT $limit
+        """
+        try:
+            result = await driver.execute_query(
+                cypher,
+                parameters_={"name": candidate_name, "limit": num_results},
+            )
+            if result.records:
+                similar = [
+                    {"uuid": r["uuid"], "name": r["name"], "similarity_score": r["score"]}
+                    for r in result.records
+                ]
+                return {"similar_candidates": similar, "source": "graph_edges"}
+        except Exception as exc:
+            logger.warning("SIMILAR_TO graph query failed (%s) — falling back to semantic", exc)
+
+        # Fallback: semantic search
+        results = await self.search(
             query=f"Candidates with similar background and skills to {candidate_name}",
             num_results=num_results,
         )
+        results["source"] = "semantic_fallback"
+        return results
 
     async def get_skill_pool(self, skill: str) -> dict[str, Any]:
-        return await self.search(
+        """
+        Get all candidates with a skill and their adjacent (co-occurring) skills.
+
+        Uses SKILL_CO_OCCURS_WITH edges built by EdgeBuilder for adjacent skills.
+        Falls back to semantic search for the candidate list if Cypher finds nothing.
+        """
+        if not self.client:
+            raise RuntimeError("Not connected. Call connect() first.")
+
+        driver = getattr(self.client.driver, "client", self.client.driver)
+
+        # Adjacent skills via co-occurrence graph
+        adjacent_cypher = """
+            MATCH (s:Entity)-[co:SKILL_CO_OCCURS_WITH]-(adj:Entity)
+            WHERE toLower(s.name) CONTAINS toLower($skill)
+            RETURN adj.name AS adjacent_skill, co.co_occurrence_count AS count
+            ORDER BY count DESC
+            LIMIT 20
+        """
+        adjacent_skills = []
+        try:
+            result = await driver.execute_query(
+                adjacent_cypher, parameters_={"skill": skill}
+            )
+            adjacent_skills = [
+                {"skill": r["adjacent_skill"], "co_occurrence_count": r["count"]}
+                for r in result.records
+            ]
+        except Exception as exc:
+            logger.warning("Adjacent skill query failed: %s", exc)
+
+        # Candidates with this skill
+        results = await self.search(
             query=f"Candidates who have {skill} skill, their experience and related skills",
             num_results=100,
         )
+        results["adjacent_skills"] = adjacent_skills
+        return results
 
     async def get_pool_intelligence(self) -> dict[str, Any]:
-        return await self.search(
-            query="Overview of all candidate skills, locations, companies, roles, and experience levels in the pool",
-            num_results=200,
+        """
+        Aggregate analytics over the full candidate pool via direct Cypher.
+
+        Returns deterministic counts and distributions rather than semantic search guesses.
+        Falls back to semantic search if Cypher queries fail.
+        """
+        if not self.client:
+            raise RuntimeError("Not connected. Call connect() first.")
+
+        driver = getattr(self.client.driver, "client", self.client.driver)
+        intelligence: dict[str, Any] = {}
+
+        # Top skills by candidate count
+        try:
+            result = await driver.execute_query("""
+                MATCH (c:Entity {group_id: 'resume-pool'})-[:HAS_SKILL]->(s:Entity)
+                RETURN s.name AS skill, count(DISTINCT c) AS candidate_count
+                ORDER BY candidate_count DESC
+                LIMIT 30
+            """)
+            intelligence["top_skills"] = [
+                {"skill": r["skill"], "candidate_count": r["candidate_count"]}
+                for r in result.records
+            ]
+        except Exception as exc:
+            logger.warning("Top skills query failed: %s", exc)
+
+        # Thin skills (supply gaps — fewest candidates)
+        try:
+            result = await driver.execute_query("""
+                MATCH (c:Entity {group_id: 'resume-pool'})-[:HAS_SKILL]->(s:Entity)
+                RETURN s.name AS skill, count(DISTINCT c) AS candidate_count
+                ORDER BY candidate_count ASC
+                LIMIT 15
+            """)
+            intelligence["thin_skills"] = [
+                {"skill": r["skill"], "candidate_count": r["candidate_count"]}
+                for r in result.records
+            ]
+        except Exception as exc:
+            logger.warning("Thin skills query failed: %s", exc)
+
+        # Top locations
+        try:
+            result = await driver.execute_query("""
+                MATCH (c:Entity {group_id: 'resume-pool'})-[:LOCATED_IN]->(loc:Entity)
+                RETURN loc.name AS location, count(DISTINCT c) AS candidate_count
+                ORDER BY candidate_count DESC
+                LIMIT 20
+            """)
+            intelligence["top_locations"] = [
+                {"location": r["location"], "candidate_count": r["candidate_count"]}
+                for r in result.records
+            ]
+        except Exception as exc:
+            logger.warning("Top locations query failed: %s", exc)
+
+        # Top companies
+        try:
+            result = await driver.execute_query("""
+                MATCH (c:Entity {group_id: 'resume-pool'})-[:WORKED_AT]->(co:Entity)
+                RETURN co.name AS company, count(DISTINCT c) AS candidate_count
+                ORDER BY candidate_count DESC
+                LIMIT 20
+            """)
+            intelligence["top_companies"] = [
+                {"company": r["company"], "candidate_count": r["candidate_count"]}
+                for r in result.records
+            ]
+        except Exception as exc:
+            logger.warning("Top companies query failed: %s", exc)
+
+        # Total candidate count
+        try:
+            result = await driver.execute_query("""
+                MATCH (c:Entity {group_id: 'resume-pool'})
+                WHERE 'Candidate' IN labels(c) OR c.name STARTS WITH '[CANDIDATE:'
+                RETURN count(c) AS total
+            """)
+            intelligence["total_candidates"] = result.records[0]["total"] if result.records else 0
+        except Exception as exc:
+            logger.warning("Total candidate count query failed: %s", exc)
+
+        # If all Cypher queries failed, fall back to semantic
+        if not intelligence:
+            logger.warning("All pool intelligence Cypher queries failed — falling back to semantic")
+            return await self._search_raw(
+                query="Overview of all candidate skills, locations, companies, roles, and experience levels in the pool",
+                num_results=200,
+            )
+
+        return intelligence
+
+    async def _search_raw(self, query: str, num_results: int) -> dict[str, Any]:
+        """Direct semantic search without query parsing — used as analytics fallback."""
+        config = COMBINED_HYBRID_SEARCH_RRF.model_copy(update={"limit": num_results})
+        results = await self.client._search(
+            query=query,
+            group_ids=[RESUME_GROUP_ID],
+            config=config,
         )
+        nodes = [self._node_to_dict(n) for n in results.nodes]
+        edges = [self._edge_to_dict(e) for e in results.edges]
+        nodes = await self._rehydrate_nodes(nodes)
+        edges = await self._rehydrate_edges(edges)
+        return {"nodes": nodes, "edges": edges}
 
     async def get_graph_for_visualization(self) -> dict[str, Any]:
         results = await self.get_pool_intelligence()
@@ -323,6 +667,14 @@ class ResumeService:
             "invalid_at": edge.invalid_at.isoformat() if hasattr(edge, "invalid_at") and edge.invalid_at else None,
         }
 
+    async def _run_edge_builder(self) -> None:
+        """Background task: build cross-candidate edges after ingest. Never raises."""
+        try:
+            summary = await self._edge_builder.build_all()
+            logger.info("EdgeBuilder complete: %s", summary)
+        except Exception as exc:
+            logger.error("EdgeBuilder background task failed: %s", exc)
+
     def _format_for_visualization(self, results: dict) -> dict[str, Any]:
         colors = {
             "Candidate": "#4ECDC4",
@@ -357,3 +709,27 @@ class ResumeService:
             for e in results.get("edges", [])
         ]
         return {"nodes": nodes, "edges": edges}
+
+
+# ── Module-level helpers ────────────────────────────────────────────────────────
+
+def _is_candidate_node(node: dict) -> bool:
+    """True if this node represents a Candidate entity."""
+    labels = node.get("labels", [])
+    name = node.get("name", "")
+    return "Candidate" in labels or (isinstance(name, str) and name.startswith("[CANDIDATE:"))
+
+
+def _parsed_to_dict(parsed) -> dict:
+    """Serialise a ParsedQuery to a plain dict for inclusion in API responses."""
+    return {
+        "location": parsed.location,
+        "min_yoe": parsed.min_yoe,
+        "max_yoe": parsed.max_yoe,
+        "must_skills": parsed.must_skills,
+        "nice_skills": parsed.nice_skills,
+        "role": parsed.role,
+        "company_type": parsed.company_type,
+        "industries": parsed.industries,
+        "semantic_query": parsed.semantic_query,
+    }
